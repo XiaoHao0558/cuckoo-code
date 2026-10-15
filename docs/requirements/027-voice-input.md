@@ -1,9 +1,9 @@
 ---
-id: 026
+id: 027
 type: feature
 title: 语音输入（录音 + 本地 faster-whisper 识别填入）
 status: review
-branch: feat/026-voice-input
+branch: feat/027-voice-input
 created: 2026-10-15
 updated: 2026-10-15
 ---
