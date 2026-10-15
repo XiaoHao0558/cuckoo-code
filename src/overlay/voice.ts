@@ -95,7 +95,15 @@ function stopRecording(): void {
         showToast('识别接口不可用', 3000);
         return;
       }
-      const res = await api.transcribeAudio({ audio: new Uint8Array(buf) });
+      let voiceCfg: any = {};
+      try {
+        voiceCfg = {
+          pythonPath: localStorage.getItem('cuckoo-voice-python') || '',
+          modelPath: localStorage.getItem('cuckoo-voice-model') || '',
+          lang: localStorage.getItem('cuckoo-voice-lang') || 'zh',
+        };
+      } catch (_) {}
+      const res = await api.transcribeAudio(Object.assign({ audio: new Uint8Array(buf) }, voiceCfg));
       if (!res || !res.success) {
         showToast('识别失败: ' + ((res && res.error) || '未知错误'), 4000);
         return;
