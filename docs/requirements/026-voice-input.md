@@ -1,7 +1,7 @@
 ---
 id: 026
 type: feature
-title: 语音输入（说话转文字填入对话）
+title: 语音输入（录音 + 本地 faster-whisper 识别填入）
 status: review
 branch: feat/026-voice-input
 created: 2026-10-15
@@ -10,69 +10,61 @@ updated: 2026-10-15
 
 ## 背景
 
-受限场景/移动场景下，用户希望**用说话代替打字**向 AI 网页（ChatGPT/DeepSeek/Claude）输入。
-当前 overlay（注入 AI 网页的悬浮层）无任何语音能力（全项目 grep 无 SpeechRecognition/getUserMedia）。
+受限/移动场景下，用户希望**用说话代替打字**向 AI 网页输入。
+当前 overlay（注入 AI 网页的悬浮层）无任何语音能力。
 
-真机实测（Electron 44 / Chromium 152，Cuckoo 内嵌网页）：
+真机实测（Electron 44 / Chromium 152，Cuckoo 内嵌 https 页面）：
 
-| 能力 | https 安全上下文 | data: URL |
-|---|---|---|
-| navigator.mediaDevices.getUserMedia | ✅ 可用 | ❌ 无 |
-| webkitSpeechRecognition | ⚠️ 存在，但 start() 报 not-allowed | — |
-| MediaRecorder | ✅ | ✅ |
-| AudioWorklet | ✅ | ❌ |
+| 能力 | 结果 |
+|---|---|
+| navigator.mediaDevices.getUserMedia | ✅ 可用（实测拿到麦克流） |
+| webkitSpeechRecognition | ⚠️ 存在，但 start() 报 not-allowed（Electron 无 Google 云端凭证）→ **不可用** |
+| MediaRecorder（webm/opus） | ✅ 可用 |
+| 本机 faster-whisper | ✅ F:\\AI\\python 已装，模型 faster-whisper-base 直接解码 webm/opus |
 
-结论：AI 网页是 https 安全上下文 → **采集层可用**；Web Speech API 在 Electron 里
-存在但不可用（Electron 不携带 Google 语音服务凭证）→ **识别层必须可插拔**。
+结论：**浏览器原生识别不可用**；改走「录音 → 本机离线 faster-whisper → 文字」，
+零云端依赖、零联网，复用本机已有模型与环境。
 
 ## 目标
 
-- overlay 增加「麦克风」按钮：点击开始录音、再点停止；识别结果填入当前 AI 输入框
-- 识别后端**可插拔**：优先浏览器原生（若某环境可用），否则走主进程可配置 STT
-- 不改动 AI 网页自身代码；失败时清晰提示，不静默
+- overlay 麦克风按钮：点击录音、再点停止；识别结果填入当前输入框（不自动发送）
+- 识别走本机 faster-whisper（离线）
+- 失败清晰提示，不静默
 
 ## 方案
 
-### 一、媒体权限（主进程，根因修复）
-`src/app/entry.ts`：AI 页面视图创建后，对其 session 设
-`setPermissionRequestHandler` / `setPermissionCheckHandler`，
-**仅放行 `media` / `audioCapture`**，其余权限维持默认拒绝（不扩大权限面）。
+### 一、媒体权限（主进程）
+`src/app/entry.ts`：AI 页面 session 设 `setPermissionRequestHandler` /
+`setPermissionCheckHandler`，仅放行 `media`/`audioCapture`，其余维持默认拒绝。
+真机验证：授权后 getUserMedia 成功拿到麦克流。
 
-真机验证（`getUserMedia` 实测）：授权后成功拿到麦克流
-（`Default - 麦克风 (HyperX Virtual Surround Sound)`）。
-此前 `webkitSpeechRecognition.start()` 报 `not-allowed` = 缺媒体权限。
+### 二、本地 STT（主进程）
+`src/app/ipc/stt.ts`（新增）：`transcribe-audio` IPC。
+- 收渲染进程传来的音频 buffer → 写临时文件 → `spawn` 本机 python 跑 faster-whisper → 返回文字
+- 内置 Python 转录脚本（String.raw 内嵌，运行时写临时文件，避免打包路径问题）
+- python / 模型路径自动探测本机常见落点（F:\\AI\\python / F:\\AI\\models\\whisper）
+- `registerSttIpc` 注册进 `app/ipc/index.ts`；`bridge/api.ts` 暴露 `transcribeAudio`
 
-### 二、语音按钮（overlay）
-- `src/overlay/template/overlay.html`：悬浮球左侧加 `#cuckoo-voice-btn`（🎤）
-- `src/overlay/template/overlay.css`：按钮样式 + 录音中红色脉冲动画
-- `src/overlay/voice.ts`（新增）：`startVoiceInput` / `stopVoiceInput` / `toggleVoiceInput`
-  - 优先用浏览器原生 `SpeechRecognition`（`webkit` 前缀），`lang='zh-CN'`、`interimResults=true`
-  - 启动前先 `getUserMedia` 申请麦克风权限（SpeechRecognition 也依赖它）
-  - 识别结束 → `appendTextToInput(text)` 填入当前 AI 输入框（**不自动发送**）
-  - 失败明确 `showToast`，不静默
-- `src/overlay/events.ts`：绑定 `#cuckoo-voice-btn` → `toggleVoiceInput()`
-
-### 技术选型说明
-- Web Speech API 在 Electron 里**存在**（`typeof === 'function'`），但历史行为报 `not-allowed`；
-  授权后是否可用**待真机验证**（Electron 不携带 Google 云端语音凭证，可能仍不可用）。
-- 因此识别层设计为「可插拔」：当前走原生；若真机不可用，后续可接本地 STT
-  （whisper.cpp / sherpa-onnx，主进程侧），无需改动采集/填入层。
+### 三、录音 + 填入（overlay）
+- `src/overlay/voice.ts`：MediaRecorder 录音（webm/opus）→ `electronAPI.transcribeAudio`
+  → `appendTextToInput(text)`（不自动发送）
+- `src/overlay/template/overlay.html`：悬浮球左侧 `#cuckoo-voice-btn`（🎤）
+- `src/overlay/template/overlay.css`：按钮样式 + 录音中脉冲动画
+- `src/overlay/events.ts`：绑定按钮 → `toggleVoiceInput()`
 
 ## 验收标准
 
-- [x] 主进程授权媒体权限，getUserMedia 可拿到麦克流（**真机实测通过**）
-- [x] overlay 麦克风按钮：录音中/空闲 状态可视（代码完成）
-- [x] 识别文字填入 AI 输入框（不自动发送）（代码完成）
+- [x] 媒体权限配置，getUserMedia 可拿到麦克流（真机实测通过）
+- [x] 本地 faster-whisper 可解码 webm/opus 并出中文文本（真机实测通过：
+      内嵌脚本输出 `{"ok": true, "text": "..."}`）
+- [x] overlay 麦克风按钮：录音中/空闲状态可视
+- [x] 识别文字填入输入框（不自动发送）
 - [x] typecheck（0 错）/ lint（0 错）/ test（879 passed）/ compile 全绿
-- [ ] 真机 npm start 验证语音识别可用性（**待用户验证**）
+- [ ] 真机 npm start 端到端验证（点按钮 → 说话 → 出字）
 
 ## 遗留 / 后续
 
-- **语音识别可用性待真机验证**：本机 `webkitSpeechRecognition` 报 `not-allowed` 已由媒体权限修复；
-  但 Electron 无 Google 云端凭证，`start()` 后能否真正出字未验证。若不可用 → 接本地 STT。
-- 采集层（getUserMedia）已实测可用，本地 STT 可直接复用，无需重构。
-- 未做「流式实时出字」：当前为「说完一次性填入」，interimResults 已开但未实时渲染。
-
-## 遗留 / 后续
-
-（完成后补）
+- **模型精度**：base 模型中文有错字，可在设置里换 larger 模型提升精度。
+- **推理速度**：base 模型 25s 音频 CPU int8 约 0.6s；更大模型更慢，可考虑 GPU。
+- **python/模型路径**：当前自动探测本机常见路径；跨机器部署需在设置中可配置。
+- 若某环境未装 faster-whisper，IPC 会返回明确错误，前端提示，不静默失败。
