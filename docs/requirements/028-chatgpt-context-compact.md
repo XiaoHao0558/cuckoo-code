@@ -1,9 +1,9 @@
 ---
-id: 027
+id: 028
 type: feature
 title: ChatGPT 上下文主动压缩（摘要 + 新会话续接）
 status: review
-branch: feat/027-chatgpt-context-compact
+branch: feat/028-chatgpt-context-compact
 created: 2026-10-15
 updated: 2026-10-15
 ---
